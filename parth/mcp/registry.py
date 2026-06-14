@@ -1,0 +1,886 @@
+"""MCP server registry — manages connections, tool registration, call routing.
+
+Bridges MCP's async Python SDK to Parth's synchronous tool execution via a
+dedicated background thread with a persistent asyncio event loop.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import pathlib
+import re
+import shutil
+import sys
+import threading
+import time
+from collections.abc import Iterable
+from dataclasses import dataclass, field
+from typing import Any, Callable, Literal, TextIO
+
+from mcp import Tool
+from mcp.client.session import ClientSession
+from mcp.client.sse import sse_client
+from mcp.client.stdio import get_default_environment, stdio_client, StdioServerParameters
+
+logger = logging.getLogger("parth.mcp")
+
+# ── tool naming ──────────────────────────────────────────────────────────
+_MCP_TOOL_PREFIX = "mcp__"
+_MCP_TOOL_RE = re.compile(r"^mcp__(.+)__(.+)$")
+
+
+def encode_tool_name(server_name: str, tool_name: str) -> str:
+    """Create namespaced Parth tool name from MCP server + tool name."""
+    return f"{_MCP_TOOL_PREFIX}{server_name}__{tool_name}"
+
+
+def decode_tool_name(parth_tool_name: str) -> tuple[str, str] | None:
+    """Extract (server_name, tool_name) from namespaced Parth tool name."""
+    m = _MCP_TOOL_RE.match(parth_tool_name)
+    if m:
+        return m.group(1), m.group(2)
+    return None
+
+
+def is_mcp_tool(parth_tool_name: str) -> bool:
+    """Check if a Parth tool name is an MCP-backed tool."""
+    return parth_tool_name.startswith(_MCP_TOOL_PREFIX)
+
+
+def _mcp_stderr_to_terminal() -> bool:
+    """When True, MCP stdio server stderr is inherited (can corrupt the TUI)."""
+    return os.getenv("PARTH_MCP_STDERR", "").strip().lower() in ("1", "true", "yes")
+
+
+def _open_stdio_errlog(server_name: str) -> TextIO:
+    """Sink for MCP server stderr — devnull by default to keep the TUI clean."""
+    if _mcp_stderr_to_terminal():
+        return sys.stderr
+    log_flag = os.getenv("PARTH_MCP_STDERR_LOG", "").strip().lower()
+    if log_flag in ("1", "true", "yes"):
+        log_dir = pathlib.Path.home() / ".config" / "parth-agent" / "mcp-logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        safe = re.sub(r"[^\w.-]+", "_", server_name) or "server"
+        return open(log_dir / f"{safe}.log", "a", encoding="utf-8")
+    return open(os.devnull, "w")
+
+
+def _stdio_env(config: dict[str, Any]) -> dict[str, str]:
+    """Build subprocess env: MCP defaults + per-server overrides."""
+    env = get_default_environment()
+    user_env = config.get("env")
+    if isinstance(user_env, dict):
+        env.update({str(k): str(v) for k, v in user_env.items()})
+    return env
+
+
+_MCP_SLOW_TOOL_MS = 5_000
+_ENV_REF_RE = re.compile(r"\$\{([^}]+)\}")
+
+
+@dataclass
+class MCPHealthRecord:
+    """Persistent health metadata for one MCP server (survives disconnect)."""
+
+    last_connect_error: str | None = None
+    last_connect_at: float | None = None
+    last_disconnect_reason: str | None = None
+    last_tool_error: str | None = None
+    last_tool_at: float | None = None
+    last_tool_ms: float | None = None
+    last_tool_name: str | None = None
+    tool_calls_ok: int = 0
+    tool_calls_err: int = 0
+
+
+MCPHealthStatus = Literal["connecting", "live", "idle", "failed", "warn"]
+
+
+def _preflight_hints(name: str, config: dict[str, Any]) -> list[str]:
+    """Surface likely setup problems before the user connects."""
+    hints: list[str] = []
+    transport = config.get("type", "stdio")
+    if transport == "stdio":
+        cmd = str(config.get("command", "")).strip()
+        if cmd and shutil.which(cmd) is None:
+            hints.append(f"command not found: {cmd}")
+    env_cfg = config.get("env")
+    if isinstance(env_cfg, dict):
+        for key, raw in env_cfg.items():
+            key_s = str(key)
+            val = str(raw)
+            if val.startswith("${") and val.endswith("}"):
+                ref = val[2:-1]
+                if ref and not os.environ.get(ref):
+                    hints.append(f"missing env: {ref}")
+            elif not os.environ.get(key_s):
+                hints.append(f"missing env: {key_s}")
+    for match in _ENV_REF_RE.finditer(str(config.get("args", []))):
+        ref = match.group(1)
+        if ref and not os.environ.get(ref):
+            hint = f"missing env: {ref}"
+            if hint not in hints:
+                hints.append(hint)
+    if not hints and transport == "sse" and not config.get("url"):
+        hints.append("missing url for sse server")
+    return hints
+
+
+# ── server state ─────────────────────────────────────────────────────────
+
+@dataclass
+class MCPServerState:
+    """Holds the active connection state for one MCP server."""
+
+    config: dict[str, Any]
+    session: ClientSession | None = None
+    tools: list[Tool] = field(default_factory=list)
+    connected: bool = False
+    error: str | None = None
+    _keep_alive_task: asyncio.Task | None = None
+    _stderr_sink: TextIO | None = None
+    _cleanup_fns: list[Callable[[], None]] = field(default_factory=list)
+
+    def add_cleanup(self, fn: Callable[[], None]) -> None:
+        self._cleanup_fns.append(fn)
+
+    def cleanup(self) -> None:
+        if self._keep_alive_task and not self._keep_alive_task.done():
+            self._keep_alive_task.cancel()
+        for fn in self._cleanup_fns:
+            try:
+                fn()
+            except Exception:
+                pass
+        self._cleanup_fns.clear()
+        if self._stderr_sink is not None and self._stderr_sink not in (sys.stderr, sys.stdout):
+            try:
+                self._stderr_sink.close()
+            except Exception:
+                pass
+            self._stderr_sink = None
+
+
+# ── event loop bridge ────────────────────────────────────────────────────
+
+class _MCPEventLoop:
+    """Dedicated asyncio event loop in a daemon thread for MCP operations."""
+
+    def __init__(self) -> None:
+        self.loop = asyncio.new_event_loop()
+        self.thread = threading.Thread(target=self._run, daemon=True, name="mcp-event-loop")
+        self.thread.start()
+
+    def _run(self) -> None:
+        asyncio.set_event_loop(self.loop)
+        self.loop.run_forever()
+
+    def run_coro(self, coro, timeout: float = 60) -> Any:
+        """Schedule a coroutine on the event loop and return result synchronously."""
+        future = asyncio.run_coroutine_threadsafe(coro, self.loop)
+        return future.result(timeout=timeout)
+
+    def run_and_forget(self, coro) -> asyncio.Task:
+        """Schedule a fire-and-forget coroutine (returns the Task)."""
+        return asyncio.run_coroutine_threadsafe(coro, self.loop)
+
+    def stop(self) -> None:
+        self.loop.call_soon_threadsafe(self.loop.stop)
+        self.thread.join(timeout=5)
+
+
+_loop: _MCPEventLoop | None = None
+_lock = threading.Lock()
+
+
+def _get_loop() -> _MCPEventLoop:
+    global _loop
+    if _loop is None:
+        with _lock:
+            if _loop is None:
+                _loop = _MCPEventLoop()
+    return _loop
+
+
+# ── tool schema helpers ──────────────────────────────────────────────────
+
+def _mcp_tool_to_schema(tool: Tool) -> dict[str, Any]:
+    """Convert an MCP Tool definition to a Parth-compatible tool schema dict."""
+    return {
+        "name": "",  # filled by caller with encoded name
+        "description": tool.description or "",
+        "input_schema": _normalize_input_schema(tool.inputSchema),
+    }
+
+
+# Schema sanitisation lives in parth.utils.schema so the API-boundary
+# layer (tools.router) and this registration path use the same logic.
+from ..utils.schema import normalize_input_schema as _normalize_input_schema
+
+
+# ── registry singleton ────────────────────────────────────────────────────
+
+class MCPRegistry:
+    """Central registry of all active MCP server connections and their tools."""
+
+    def __init__(self) -> None:
+        self._servers: dict[str, MCPServerState] = {}
+        self._health: dict[str, MCPHealthRecord] = {}
+        self._lock = threading.Lock()
+
+        # References to the Parth tool system — set via init_parth()
+        self._func_dict: dict | None = None
+        self._tool_groups: dict | None = None
+        self._tools_list: list | None = None
+        self._tool_name_to_group: dict | None = None
+        self._console_print: Callable | None = None
+
+    # ── integration with Parth tool infra ───────────────────────────────
+
+    def init_parth(
+        self,
+        func_dict: dict,
+        tool_groups: dict,
+        tools_list: list,
+        tool_name_to_group: dict | None = None,
+        console_print: Callable | None = None,
+    ) -> None:
+        """Wire the registry into Parth's global tool dictionaries."""
+        self._func_dict = func_dict
+        self._tool_groups = tool_groups
+        self._tools_list = tools_list
+        self._tool_name_to_group = tool_name_to_group
+        self._console_print = console_print
+
+    def _log(self, msg: str, level: str = "info") -> None:
+        getattr(logger, level, logger.info)(msg)
+        if self._console_print:
+            color = {"info": "dim", "warn": "yellow", "error": "red"}.get(level, "dim")
+            self._console_print(f"[{color}]mcp: {msg}[/]")
+
+    def _health_record(self, server_name: str) -> MCPHealthRecord:
+        rec = self._health.get(server_name)
+        if rec is None:
+            rec = MCPHealthRecord()
+            self._health[server_name] = rec
+        return rec
+
+    def _record_connect_error(self, server_name: str, error: str) -> None:
+        with self._lock:
+            rec = self._health_record(server_name)
+            rec.last_connect_error = error
+            rec.last_disconnect_reason = None
+
+    def _record_connect_ok(self, server_name: str) -> None:
+        with self._lock:
+            rec = self._health_record(server_name)
+            rec.last_connect_error = None
+            rec.last_connect_at = time.monotonic()
+            rec.last_disconnect_reason = None
+
+    def _record_disconnect(self, server_name: str, reason: str | None = None) -> None:
+        with self._lock:
+            rec = self._health_record(server_name)
+            if reason:
+                rec.last_disconnect_reason = reason
+
+    def _record_runtime_error(self, server_name: str, error: str) -> None:
+        with self._lock:
+            rec = self._health_record(server_name)
+            rec.last_disconnect_reason = error
+
+    def get_server_health(
+        self,
+        server_name: str,
+        config: dict[str, Any] | None = None,
+        *,
+        connecting: bool = False,
+    ) -> dict[str, Any]:
+        """Return UI-friendly health for one server."""
+        with self._lock:
+            rec = self._health_record(server_name)
+            connected = (
+                server_name in self._servers
+                and self._servers[server_name].connected
+            )
+            tool_count = (
+                len(self._servers[server_name].tools)
+                if connected
+                else 0
+            )
+            last_connect_error = rec.last_connect_error
+            last_tool_error = rec.last_tool_error
+            last_tool_ms = rec.last_tool_ms
+            last_tool_name = rec.last_tool_name
+            last_tool_at = rec.last_tool_at
+            last_disconnect = rec.last_disconnect_reason
+            tool_calls_err = rec.tool_calls_err
+
+        hints = _preflight_hints(server_name, config) if config else []
+
+        if connecting:
+            status: MCPHealthStatus = "connecting"
+        elif connected:
+            if last_tool_error and tool_calls_err > 0:
+                status = "warn"
+            elif last_tool_ms is not None and last_tool_ms >= _MCP_SLOW_TOOL_MS:
+                status = "warn"
+            else:
+                status = "live"
+        elif last_connect_error:
+            status = "failed"
+        elif hints:
+            status = "warn"
+        else:
+            status = "idle"
+
+        detail_parts: list[str] = []
+        if last_connect_error:
+            detail_parts.append(f"connect failed: {last_connect_error}")
+        if last_disconnect and not connected:
+            detail_parts.append(f"disconnected: {last_disconnect}")
+        if last_tool_error:
+            detail_parts.append(f"last tool error: {last_tool_error}")
+        elif last_tool_name and last_tool_ms is not None and connected:
+            detail_parts.append(
+                f"last tool {last_tool_name} ({last_tool_ms:.0f}ms)"
+            )
+        if hints:
+            detail_parts.append(" · ".join(hints))
+
+        summary = {
+            "live": f"live · {tool_count} tools",
+            "idle": "idle · not connected",
+            "connecting": "connecting…",
+            "failed": "connect failed",
+            "warn": "needs attention",
+        }[status]
+
+        return {
+            "status": status,
+            "summary": summary,
+            "detail": " · ".join(detail_parts) if detail_parts else "",
+            "hints": hints,
+            "connected": connected,
+            "tool_count": tool_count,
+            "last_connect_error": last_connect_error,
+        }
+
+    def health_counts(
+        self,
+        names: Iterable[str],
+        *,
+        connecting: set[str] | None = None,
+    ) -> dict[str, int]:
+        """Aggregate health states for a list of configured server names."""
+        connecting = connecting or set()
+        counts = {"live": 0, "idle": 0, "failed": 0, "warn": 0, "connecting": 0}
+        config = None
+        try:
+            from .config import get_config
+            config = get_config()
+        except Exception:
+            pass
+        for name in names:
+            if name in connecting:
+                counts["connecting"] += 1
+                continue
+            cfg = config.get_server(name) if config else None
+            h = self.get_server_health(name, cfg)
+            counts[h["status"]] = counts.get(h["status"], 0) + 1
+        return counts
+
+    # ── tool schema management ───────────────────────────────────────────
+
+    def get_tool_schemas(self) -> list[dict[str, Any]]:
+        """Return tool schemas for all currently connected MCP servers."""
+        schemas = []
+        with self._lock:
+            for server_name, state in self._servers.items():
+                if not state.connected or state.session is None:
+                    continue
+                for tool in state.tools:
+                    schema = _mcp_tool_to_schema(tool)
+                    schema["name"] = encode_tool_name(server_name, tool.name)
+                    schemas.append(schema)
+        return schemas
+
+    def _register_tools(self, server_name: str, tools: list[Tool]) -> None:
+        """Register MCP tools into the Parth tool system (FUNC + TOOL_NAME_TO_GROUP)."""
+        if self._func_dict is not None:
+            for tool in tools:
+                parth_name = encode_tool_name(server_name, tool.name)
+
+                # Closure captures server/tool names for this handler
+                def _make_handler(srv: str, t: Tool) -> Callable:
+                    def handler(**kwargs: Any) -> str:
+                        return self._call_mcp_tool(srv, t.name, kwargs)
+                    handler.__name__ = encode_tool_name(srv, t.name)
+                    handler.__qualname__ = f"MCP.{srv}.{t.name}"
+                    return handler
+
+                self._func_dict[parth_name] = _make_handler(server_name, tool)
+
+        # Also update TOOL_NAME_TO_GROUP if accessible
+        self._rebuild_tool_group()
+
+    def _unregister_tools(self, server_name: str, tools: list[Tool]) -> None:
+        """Remove MCP tools from the Parth tool system."""
+        if self._func_dict is not None:
+            for tool in tools:
+                parth_name = encode_tool_name(server_name, tool.name)
+                self._func_dict.pop(parth_name, None)
+        self._rebuild_tool_group()
+
+    def _rebuild_tool_group(self) -> None:
+        """Rebuild the 'mcp' group in TOOL_GROUPS and update TOOL_NAME_TO_GROUP."""
+        schemas = self.get_tool_schemas()
+        if self._tool_groups is not None:
+            old = self._tool_groups.get("mcp", [])
+            old.clear()
+            old.extend(schemas)
+
+        # Update TOOL_NAME_TO_GROUP — remove old mcp entries, add current ones
+        if self._tool_name_to_group is not None:
+            # Remove any existing mcp entries
+            to_del = [k for k, v in self._tool_name_to_group.items() if v == "mcp"]
+            for k in to_del:
+                del self._tool_name_to_group[k]
+            # Add current ones
+            for s in schemas:
+                self._tool_name_to_group[s["name"]] = "mcp"
+
+    # ── connection management ───────────────────────────────────────────
+
+    def connect(self, server_name: str, config: dict[str, Any]) -> str | None:
+        """Connect to an MCP server and register its tools.
+
+        Returns error message on failure, None on success.
+        """
+        with self._lock:
+            if server_name in self._servers and self._servers[server_name].connected:
+                return f"Server '{server_name}' is already connected"
+
+            state = MCPServerState(config=config)
+            self._servers[server_name] = state
+
+        loop = _get_loop()
+        try:
+            transport_type = config.get("type", "stdio")
+
+            if transport_type == "stdio":
+                error = loop.run_coro(
+                    self._connect_and_init_stdio(server_name, state, config),
+                    timeout=30,
+                )
+            elif transport_type == "sse":
+                error = loop.run_coro(
+                    self._connect_and_init_sse(server_name, state, config),
+                    timeout=30,
+                )
+            else:
+                error = f"Unknown transport type: {transport_type}"
+
+            if error:
+                with self._lock:
+                    state.connected = False
+                    state.error = error
+                    state.cleanup()
+                    if server_name in self._servers:
+                        del self._servers[server_name]
+                self._record_connect_error(server_name, error)
+                self._log(f"failed to connect '{server_name}': {error}", "error")
+                return error
+
+            # List tools
+            assert state.session is not None
+            result = loop.run_coro(state.session.list_tools(), timeout=30)
+            tools: list[Tool] = result.tools if hasattr(result, "tools") else []
+            with self._lock:
+                state.tools = tools
+                state.connected = True
+
+            self._register_tools(server_name, tools)
+            self._record_connect_ok(server_name)
+            self._log(f"connected '{server_name}' ({len(tools)} tools)", "info")
+            return None
+
+        except Exception as e:
+            error = f"{type(e).__name__}: {e}"
+            with self._lock:
+                if server_name in self._servers:
+                    state = self._servers[server_name]
+                    state.connected = False
+                    state.error = error
+                    state.cleanup()
+                    del self._servers[server_name]
+            self._record_connect_error(server_name, error)
+            self._log(f"error connecting '{server_name}': {error}", "error")
+            return error
+
+    async def _connect_and_init_stdio(
+        self,
+        server_name: str,
+        state: MCPServerState,
+        config: dict[str, Any],
+    ) -> str | None:
+        """Phase 1: create stdio process, session, initialize. Returns None on success, error string on failure."""
+        try:
+            errlog = _open_stdio_errlog(server_name)
+            state._stderr_sink = errlog
+            params = StdioServerParameters(
+                command=config["command"],
+                args=config.get("args", []),
+                env=_stdio_env(config),
+                cwd=config.get("cwd"),
+            )
+
+            # These streams are passed directly to the keep-alive task
+            streams: list[Any] = []
+
+            async def _inner() -> tuple[ClientSession, Any, Any]:
+                ctx = stdio_client(params, errlog=errlog)
+                read_stream, write_stream = await ctx.__aenter__()
+                streams.extend([ctx, read_stream, write_stream])
+                session = ClientSession(read_stream, write_stream)
+                await session.__aenter__()
+                await session.initialize()
+                return session, ctx, read_stream, write_stream
+
+            session, ctx, read_stream, write_stream = await _inner()
+            state.session = session
+
+            # Start keep-alive task that holds the context managers open
+            loop = asyncio.get_running_loop()
+            state._keep_alive_task = asyncio.ensure_future(
+                self._keep_stdio_alive(ctx, read_stream, write_stream, session, server_name)
+            )
+            return None
+
+        except Exception as e:
+            return f"{type(e).__name__}: {e}"
+
+    async def _keep_stdio_alive(
+        self,
+        ctx,
+        read_stream,
+        write_stream,
+        session: ClientSession,
+        server_name: str,
+    ) -> None:
+        """Keep the stdio connection alive by parking the coroutine."""
+        try:
+            # Hold the context managers open indefinitely
+            # Any disconnect will raise an exception here
+            while True:
+                await asyncio.sleep(3600)
+        except (asyncio.CancelledError, GeneratorExit):
+            pass
+        except Exception as e:
+            self._log(f"connection lost for '{server_name}': {e}", "warn")
+            self._record_runtime_error(server_name, f"{type(e).__name__}: {e}")
+        finally:
+            # Cleanup
+            try:
+                await session.__aexit__(None, None, None)
+            except Exception:
+                pass
+            try:
+                await ctx.__aexit__(None, None, None)
+            except Exception:
+                pass
+
+    async def _connect_and_init_sse(
+        self,
+        server_name: str,
+        state: MCPServerState,
+        config: dict[str, Any],
+    ) -> str | None:
+        """Connect to an SSE-based MCP server."""
+        try:
+            headers = config.get("headers", {})
+            url = config["url"]
+
+            streams: list[Any] = []
+
+            async def _inner() -> tuple[ClientSession, Any, Any]:
+                ctx = sse_client(url, headers=headers)
+                read_stream, write_stream = await ctx.__aenter__()
+                streams.extend([ctx, read_stream, write_stream])
+                session = ClientSession(read_stream, write_stream)
+                await session.__aenter__()
+                await session.initialize()
+                return session, ctx, read_stream, write_stream
+
+            session, ctx, read_stream, write_stream = await _inner()
+            state.session = session
+
+            loop = asyncio.get_running_loop()
+            state._keep_alive_task = asyncio.ensure_future(
+                self._keep_sse_alive(ctx, read_stream, write_stream, session, server_name)
+            )
+            return None
+
+        except Exception as e:
+            return f"{type(e).__name__}: {e}"
+
+    async def _keep_sse_alive(
+        self,
+        ctx,
+        read_stream,
+        write_stream,
+        session: ClientSession,
+        server_name: str,
+    ) -> None:
+        """Keep the SSE connection alive."""
+        try:
+            while True:
+                await asyncio.sleep(3600)
+        except (asyncio.CancelledError, GeneratorExit):
+            pass
+        except Exception as e:
+            self._log(f"SSE connection lost for '{server_name}': {e}", "warn")
+            self._record_runtime_error(server_name, f"{type(e).__name__}: {e}")
+        finally:
+            try:
+                await session.__aexit__(None, None, None)
+            except Exception:
+                pass
+            try:
+                await ctx.__aexit__(None, None, None)
+            except Exception:
+                pass
+
+    def disconnect(self, server_name: str) -> str | None:
+        """Disconnect an MCP server and unregister its tools.
+
+        Safe to call from any thread — the keep-alive task lives on the
+        MCP event-loop thread and is cancelled via ``call_soon_threadsafe``.
+        """
+        with self._lock:
+            srv = self._servers.get(server_name)
+            if srv is None:
+                return f"Server '{server_name}' not found"
+            tools = list(srv.tools)
+            keep_alive = srv._keep_alive_task
+            cleanup_fns = list(srv._cleanup_fns)
+            srv._cleanup_fns.clear()
+            del self._servers[server_name]
+
+        # Cancel the keep-alive task on its own loop (cross-thread safe).
+        if keep_alive is not None and not keep_alive.done():
+            try:
+                loop_obj = _get_loop()
+                loop_obj.loop.call_soon_threadsafe(keep_alive.cancel)
+            except Exception as e:
+                self._log(f"keep-alive cancel failed for '{server_name}': {e}", "warn")
+
+        # Run any cleanup functions outside the lock.
+        for fn in cleanup_fns:
+            try:
+                fn()
+            except Exception:
+                pass
+
+        self._unregister_tools(server_name, tools)
+        self._record_disconnect(server_name)
+        self._log(f"disconnected '{server_name}'", "info")
+        return None
+
+    def disconnect_all(self) -> None:
+        """Disconnect all MCP servers."""
+        names = list(self._servers.keys())
+        for name in names:
+            self.disconnect(name)
+
+    # ── tool call routing ────────────────────────────────────────────────
+
+    def _call_mcp_tool(self, server_name: str, tool_name: str, args: dict[str, Any]) -> str:
+        """Call an MCP tool on the connected server and return the result as a string."""
+        with self._lock:
+            state = self._servers.get(server_name)
+            if state is None or not state.connected or state.session is None:
+                return f"ERROR: MCP server '{server_name}' is not connected"
+            session = state.session
+
+        loop = _get_loop()
+        t0 = time.monotonic()
+        try:
+            result = loop.run_coro(
+                session.call_tool(tool_name, arguments=args),
+                timeout=120,
+            )
+            out = self._format_tool_result(result)
+            elapsed_ms = (time.monotonic() - t0) * 1000
+            is_err = out.startswith("ERROR:")
+            with self._lock:
+                rec = self._health_record(server_name)
+                rec.last_tool_at = time.monotonic()
+                rec.last_tool_ms = elapsed_ms
+                rec.last_tool_name = tool_name
+                if is_err:
+                    rec.last_tool_error = out[:240]
+                    rec.tool_calls_err += 1
+                else:
+                    rec.last_tool_error = None
+                    rec.tool_calls_ok += 1
+            return out
+        except TimeoutError:
+            elapsed_ms = (time.monotonic() - t0) * 1000
+            err = f"ERROR: MCP tool '{server_name}/{tool_name}' timed out (120s)"
+            with self._lock:
+                rec = self._health_record(server_name)
+                rec.last_tool_at = time.monotonic()
+                rec.last_tool_ms = elapsed_ms
+                rec.last_tool_name = tool_name
+                rec.last_tool_error = err
+                rec.tool_calls_err += 1
+            return err
+        except Exception as e:
+            elapsed_ms = (time.monotonic() - t0) * 1000
+            err = f"ERROR: {type(e).__name__}: {e}"
+            with self._lock:
+                rec = self._health_record(server_name)
+                rec.last_tool_at = time.monotonic()
+                rec.last_tool_ms = elapsed_ms
+                rec.last_tool_name = tool_name
+                rec.last_tool_error = err
+                rec.tool_calls_err += 1
+            return err
+
+    def _format_tool_result(self, result) -> str:
+        """Format an MCP CallToolResult into a string."""
+        if hasattr(result, "content"):
+            parts = []
+            for item in result.content:
+                if hasattr(item, "text") and item.text:
+                    parts.append(item.text)
+                elif hasattr(item, "data") and item.data:
+                    parts.append(f"[binary data: {len(item.data)} bytes]")
+                elif hasattr(item, "resource"):
+                    parts.append(f"[resource: {item.resource}]")
+            text = "\n".join(parts)
+            if hasattr(result, "isError") and result.isError:
+                return f"ERROR:\n{text}"
+            return text
+        return str(result)
+
+    # ── queries ──────────────────────────────────────────────────────────
+
+    def list_connected(self) -> list[tuple[str, list[Tool], str | None]]:
+        """List connected servers with their tools and optional error."""
+        results = []
+        with self._lock:
+            for name, state in self._servers.items():
+                results.append((name, state.tools, state.error if not state.connected else None))
+        return results
+
+    def is_connected(self, server_name: str) -> bool:
+        """Check if a specific server is connected."""
+        with self._lock:
+            state = self._servers.get(server_name)
+            return state is not None and state.connected
+
+    def get_server_tools(self, server_name: str) -> list[Tool]:
+        """Get tools for a connected server."""
+        with self._lock:
+            state = self._servers.get(server_name)
+            if state:
+                return state.tools
+            return []
+
+    def tool_count(self) -> int:
+        """Total number of registered MCP tools across all servers."""
+        count = 0
+        with self._lock:
+            for state in self._servers.values():
+                if state.connected:
+                    count += len(state.tools)
+        return count
+
+
+# Global singleton
+mcp_registry = MCPRegistry()
+
+
+def as_prompt_block() -> str:
+    """Format configured MCP servers into the system prompt.
+
+    Project-scoped servers are always listed. Global sources appear when
+    ``state.global_mcp`` is on. Connection status is included so the agent
+    knows which tools are callable vs need ``/mcp`` connect first.
+    """
+    from .. import state as parth_state
+    from .config import get_config
+
+    config = get_config()
+    servers = config.list_servers()
+
+    lines: list[str] = []
+    if not parth_state.global_mcp:
+        lines.append(
+            "MCP scope: project-only (global OFF). "
+            "Servers from ~/.cursor, ~/.claude, OpenCode, etc. are NOT loaded. "
+            "Enable via /mcp → press g, then connect. "
+            "Do NOT read those config files to bypass missing MCP — tell the user to enable global scope."
+        )
+
+    if not servers:
+        if lines:
+            lines.append(
+                "No MCP servers in current scope (add .mcp.json in project or enable global scope)."
+            )
+            return "\n".join(lines)
+        return ""
+
+    connected = mcp_registry.list_connected()
+    live_names = {name for name, _tools, _err in connected}
+
+    scope = "project + global" if parth_state.global_mcp else "project-only"
+    names = sorted(servers.keys())
+    lines.append(
+        f"MCP ({scope}): "
+        + ", ".join(
+            name if name in live_names else f"{name} (offline — connect via /mcp)"
+            for name in names
+        )
+    )
+    if live_names:
+        lines.append(
+            "Connected MCP tools are callable as mcp__<server>__<tool>."
+            " Re-check after /mcp scope or connection changes in the same session."
+        )
+    else:
+        lines.append(
+            "No MCP servers connected — open /mcp and connect before calling MCP tools."
+        )
+    return "\n".join(lines)
+
+
+def auto_connect_servers(console_print: Callable | None = None) -> None:
+    """Auto-connect MCP servers listed in the config's auto_connect field."""
+    from .config import get_config
+
+    config = get_config()
+    names = config.get_auto_connect()
+    if not names:
+        if console_print:
+            console_print("[dim]mcp: no servers configured for auto-connect[/]")
+        return
+
+    for name in names:
+        server_cfg = config.get_server(name)
+        if server_cfg is None:
+            if console_print:
+                console_print(f"[yellow]mcp: server '{name}' not found in config, skipping[/]")
+            continue
+        if console_print:
+            console_print(f"[dim]mcp: auto-connecting '{name}'…[/]")
+        error = mcp_registry.connect(name, server_cfg)
+        if error and console_print:
+            console_print(f"[red]mcp: failed to connect '{name}': {error}[/]")
+        elif console_print:
+            cnt = len(mcp_registry.get_server_tools(name))
+            console_print(f"[green]mcp: '{name}' connected ({cnt} tools)[/]")

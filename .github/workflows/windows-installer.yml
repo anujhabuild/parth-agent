@@ -1,0 +1,117 @@
+name: windows-installer
+
+# Builds parth-agent-{version}-x64-setup.exe on every push to main and every
+# `v*` tag. On a tag push the installer is attached to a GitHub Release so the
+# in-app updater (parth/updater_installer.py) can pick it up.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed by softprops/action-gh-release on tag push
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip downloads
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\pip\Cache
+          key: pip-${{ runner.os }}-${{ hashFiles('pyproject.toml', 'requirements.txt') }}
+          restore-keys: |
+            pip-${{ runner.os }}-
+
+      - name: Install dependencies + PyInstaller
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip wheel
+          pip install -e ".[build-windows]"
+
+      - name: Read VERSION from parth.constants.models
+        id: version
+        shell: pwsh
+        run: |
+          $v = python -c "from parth.constants.models import VERSION; print(VERSION)"
+          $v = $v.Trim()
+          if (-not ($v -match '^\d+\.\d+\.\d+')) {
+            Write-Error "VERSION '$v' is not a dotted x.y.z string"
+            exit 1
+          }
+          Write-Output "version=$v" >> $env:GITHUB_OUTPUT
+          Write-Host "Resolved version: $v"
+
+      - name: Verify tag matches VERSION (tag pushes only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GIT_REF: ${{ github.ref }}
+          SRC_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # Strip refs/tags/v prefix from the ref name (passed in via env so
+          # no untrusted string ever lands in a `run:` command).
+          $tag = $env:GIT_REF -replace '^refs/tags/v',''
+          if ($tag -ne $env:SRC_VERSION) {
+            Write-Error "Tag v$tag does not match VERSION $env:SRC_VERSION in parth/constants/models.py"
+            exit 1
+          }
+          Write-Host "Tag matches source version: v$tag"
+
+      - name: Smoke-test the package imports
+        shell: pwsh
+        run: python -c "import parth, parth.cli, parth.tui.theme, parth.tools, parth.updater_installer; print('imports ok')"
+
+      - name: Build PyInstaller bundle
+        shell: pwsh
+        run: pyinstaller installer\parth.spec --noconfirm --clean
+
+      - name: Verify built executable launches
+        shell: pwsh
+        run: |
+          # --help should exit 0 without needing a TUI; sanity check that the
+          # bundle has all its data and hidden imports.
+          .\dist\parth\parth.exe --help
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress --yes
+
+      - name: Compile installer with version stamp
+        shell: pwsh
+        env:
+          PARTH_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          & $iscc "/DAppVersion=$env:PARTH_VERSION" installer\parth.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem installer\Output
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: parth-agent-${{ steps.version.outputs.version }}-x64-setup
+          path: installer\Output\parth-agent-${{ steps.version.outputs.version }}-x64-setup.exe
+          if-no-files-found: error
+
+      - name: Attach installer to release (on tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: installer\Output\parth-agent-${{ steps.version.outputs.version }}-x64-setup.exe
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

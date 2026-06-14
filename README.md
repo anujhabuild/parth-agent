@@ -1,0 +1,336 @@
+# Parth — Parth Terminal Agent
+
+**AI coding agent for your Windows terminal.**  
+Chat, run tools, edit files, execute shell commands — all from one TUI.
+
+
+
+---
+
+## ✨ Overview
+
+Parth is a **terminal-native AI agent** that lives in your Windows terminal. You talk to it, it uses tools — reads/writes files, runs shell commands, searches code, uses git, OCRs images, browses the web — and gets work done right where your code lives.
+
+> **No web UI, no daemon.** Just `parth` in your project folder.
+
+> **Windows-only build.** This branch ships an MSI/EXE installer for Windows (Inno Setup). See [`WINDOWS_BUILD.md`](WINDOWS_BUILD.md) for build & install steps.
+
+---
+
+## 🚀 Quick Start
+
+**macOS without Python 3.10+** (install Python, then Parth):
+
+```bash
+brew install python@3.11
+curl -fsSL https://raw.githubusercontent.com/PrajsRamteke/parth-agent/main/scripts/install | bash
+source ~/.zshrc   # or ~/.zprofile on macOS — needed so `parth` is on PATH
+parth
+```
+
+If `parth` is not found in the same terminal right after install:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+parth
+```
+
+**Already have Python 3.10+:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/PrajsRamteke/parth-agent/main/scripts/install | bash
+source ~/.zshrc   # or ~/.zprofile on macOS
+parth
+```
+
+That's it. You'll be prompted to pick an auth method on first run.
+
+---
+
+## 🖼️ Screenshots
+
+
+|     |     |
+| --- | --- |
+|     |     |
+
+
+---
+
+## 📋 Table of Contents
+
+- [Features](#-features)
+- [Requirements](#-requirements)
+- [Installation](#-installation)
+- [Usage](#-usage)
+- [Slash Commands](#-slash-commands)
+- [Environment Variables](#-environment-variables)
+- [Project Layout](#-project-layout)
+- [Notes](#-notes)
+
+---
+
+## 🧰 Features
+
+
+|                                                                                                                                 |                                                                                                                                            |
+| ------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| 💬 Interactive TUIRich terminal UI with markdown rendering, syntax-highlighted code, panels, and streaming responses.          | 🔐 Dual AuthUse an **API key** (sk-ant-…) or sign in with **OAuth** via PKCE.                                                             |
+| 📁 File OperationsRead, write, edit files. List directories, glob patterns, rank files by relevance, search code with ripgrep. | 🐚 Shell AccessRun any shell command, view output inline — no context switching.                                                          |
+| ⎇ Git IntegrationStatus, diff, log — all from the chat. No need to tab out.                                                    | 🖥️ macOS ControlLaunch/focus/quit apps, click UI elements, type text, run AppleScript, use keyboard shortcuts, clipboard, notifications. |
+| 🌐 Web AccessSearch the web and fetch URLs. Verified search cross-checks multiple sources for factual answers.                 | 🧠 Persistent MemoryRemembers facts about you across sessions. Stores skills, notes, and aliases under `~/.config/claude-agent/`.         |
+| 📊 Cost Tracking`/cost` shows token usage and estimated USD spend per session.                                                 | 🔌 MCP SupportModel Context Protocol — connect external tools and data sources.                                                           |
+| 🎨 ThemesBuilt-in **red** and **purple** themes. Easily extensible.                                                            |                                                                                                                                            |
+
+
+---
+
+## ✅ Requirements
+
+- **Python 3.10+** — macOS ships with older system Python (`/usr/bin/python3`). Install a newer one before the install script:
+  ```bash
+  brew install python@3.11
+  ```
+  The install script also checks `/opt/homebrew/bin/python3.*` if Homebrew is not on your `PATH` yet.
+- **macOS** — required for macOS control features. Core agent works on any platform.
+- **API key** (sk-ant-…) or a **Pro/Max subscription**
+
+---
+
+## 📦 Installation
+
+### One-command install (recommended)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/PrajsRamteke/parth-agent/main/scripts/install | bash
+```
+
+After install, open a **new terminal**, go to any project, and run:
+
+```bash
+parth
+```
+
+**Troubleshooting: "command not found: parth"**
+
+If your shell can't find `parth`, add `~/.local/bin` to your PATH:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+parth
+```
+
+Add that line to your `~/.zshrc` to make it permanent.
+
+
+
+### Development setup
+
+From the repository root, run these **one at a time** (Python **3.10+**):
+
+```bash
+git clone https://github.com/PrajsRamteke/parth-agent.git
+cd parth-agent
+python3 -m venv .venv
+source .venv/bin/activate    # Windows: .venv\Scripts\activate
+pip install -e .
+parth --help                # verify the CLI is on PATH
+```
+
+`pip install -e .` installs runtime dependencies from `pyproject.toml` and registers the `parth` command. You do **not** need `pip install -r requirements.txt` for normal development (that file mirrors the same deps for reference or tooling-only installs).
+
+**Run the agent:**
+
+```bash
+parth                     # TUI mode (default)
+python agent.py            # same as parth
+python agent.py --legacy   # Rich REPL mode
+```
+
+**Run tests** (after `pip install pytest`):
+
+```bash
+python -m pytest tests/ -q
+```
+
+The same setup sequence is documented at the top of `requirements.txt`.
+
+---
+
+## 🎮 Usage
+
+```bash
+parth
+```
+
+Run it from the **folder you want it to work in**. The status bar shows the current project path — all file operations, code searches, and shell commands are scoped to that directory.
+
+### First run
+
+On first launch, you'll pick how to authenticate:
+
+
+| Option      | How it works                                                                      |
+| ----------- | --------------------------------------------------------------------------------- |
+| **API key** | Paste an `sk-ant-…` key. Saved at `~/.config/claude-agent/key` (permissions: 600) |
+| **OAuth**   | Opens your browser to sign in with your Pro/Max account via PKCE                  |
+
+
+### ⌨️ Slash Commands
+
+
+| Command             | What it does                                                    |
+| ------------------- | --------------------------------------------------------------- |
+| `/help`             | List all commands                                               |
+| `/model <name>`     | Switch models (e.g. `opus-4-7`, `haiku-4-5`)                    |
+| `/agent`            | Open the agent picker — choose a project or global agent        |
+| `/agent <name>`     | Activate an agent by name (Tab cycles through agents)           |
+| `/agent new <name>` | Scaffold a new agent in `.parth/agents/<name>.md`             |
+| `/agent init`       | Scaffold a `.parth/` tree in the current project              |
+| `/skill`            | Open the skill browser (LLM auto-invokes skills by description) |
+| `/verbose` / `F2`   | Toggle internal thinking and tool traces (shown by default)     |
+| `/cost`             | Show token usage + estimated USD cost                           |
+| `/clear`            | Reset the conversation                                          |
+| `/logout`           | Clear saved credentials                                         |
+| `/theme`            | Switch themes                                                   |
+
+
+---
+
+## ⚙️ Environment Variables
+
+
+| Variable                       | What it does                           | Default                            |
+| ------------------------------ | -------------------------------------- | ---------------------------------- |
+| `ANTHROPIC_API_KEY`            | Use this key instead of the stored one | —                                  |
+| `CLAUDE_MODEL`                 | Override default model                 | `sonnet-4-6`                       |
+| `PARTH_MAX_PARALLEL_TOOLS`   | Max concurrent tool workers            | `64` (capped)                      |
+| `PARTH_HTTP_READ_TIMEOUT`    | Streaming response timeout (s)         | `240` (OpenRouter), `600` (direct) |
+| `PARTH_HTTP_CONNECT_TIMEOUT` | Connection timeout (s)                 | `30`                               |
+| `PARTH_STREAM_REPLY`         | Set to `0` to disable live streaming   | `1`                                |
+
+
+---
+
+## 🎛️ Agents & Skills
+
+Parth uses two file-based extension points — **agents** (manual select) and
+**skills** (LLM auto-invoke) — that aggregate from every AI tool's config
+directory (Parth, Claude Code, OpenCode, Cursor, Windsurf, …).
+
+```
+project/
+├── .parth/
+│   ├── agents/                   ← project-local agents
+│   │   ├── coding.md             ← user-creatable .md files with YAML frontmatter
+│   │   ├── reverse_eng.md
+│   │   └── setup.md
+│   ├── skills/                   ← project-local skills
+│   │   ├── debugging/SKILL.md
+│   │   ├── testing/SKILL.md
+│   │   └── security/SKILL.md
+│   └── settings.json             ← (optional) per-project overrides
+│
+├── AGENTS.md  /  CLAUDE.md       ← project context (auto-detected)
+└── …
+
+~/.parth/                       ← user-global counterpart
+├── agents/                       ← bundled coding/reverse_eng/setup seeded on first run
+├── skills/
+└── settings.json
+```
+
+**Agents** — markdown files with frontmatter (`name`, `description`, optional
+`icon`/`color`). The active agent's body is appended to the system prompt.
+One active at a time, shown in the status bar. `/agent` opens the picker;
+`Tab` cycles. Project agents are always available; global ones require
+`agent.global = true` in settings (or `/agent global on`).
+
+**Skills** — `SKILL.md` packs with `name` + `description`. The LLM sees all
+discovered descriptions and decides when to load a skill itself via
+`/skill load <name>`. The `/skill` modal is a read-only browser.
+
+---
+
+## 🗂️ Project Layout
+
+```
+parth/
+├── agent.py                # Entry point (routes to TUI or REPL)
+├── pyproject.toml          # Package config
+├── requirements.txt
+├── CLAUDE.md               # Context file for AI assistants
+├── PARTH.md
+│
+├── parth/                 # Main package
+│   ├── __main__.py         # `python -m parth`
+│   ├── cli.py              # CLI entry point
+│   ├── main.py             # Core send-and-loop logic
+│   ├── state.py            # Module-level shared state
+│   │
+│   ├── auth/               # Authentication
+│   │   ├── client.py       # Unified client factory
+│   │   ├── api_key.py      # API key handling
+│   │   ├── oauth_flow.py   # OAuth PKCE flow
+│   │   ├── pkce.py         # PKCE utilities
+│   │   ├── openrouter.py   # OpenRouter support
+│   │   └── opencode.py     # OpenCode adapter
+│   │
+│   ├── tools/              # Tool implementations
+│   │   ├── router.py       # Dynamic tool selection
+│   │   ├── schemas_core.py # Core tool schemas
+│   │   ├── schemas_mac.py  # macOS tool schemas
+│   │   ├── mac/            # macOS control
+│   │   └── web/            # Web fetch & search
+│   │
+│   ├── repl/               # Response handling
+│   │   ├── stream.py       # Stream processing
+│   │   ├── render.py       # Tool execution + rendering
+│   │   ├── hallucination.py
+│   │   └── trim.py         # Context trimming
+│   │
+│   ├── tui/                # Textual TUI
+│   │   ├── app.py          # Terminal UI app
+│   │   ├── agent_modal.py  # Agent picker
+│   │   └── skill_modal.py  # Skill browser (read-only)
+│   │
+│   ├── commands/           # Slash commands
+│   │   ├── dispatch.py
+│   │   ├── agent.py        # /agent — pick / new / init / refresh
+│   │   └── skill.py        # /skill — list / load / refresh
+│   │
+│   ├── storage/            # Persistence
+│   │   ├── sessions.py     # SQLite session history
+│   │   ├── memory.py       # User memory
+│   │   ├── agents.py       # Agent discovery & loading
+│   │   ├── skills.py       # Skill discovery & loading
+│   │   ├── settings.py     # Unified settings.json (global + project merge)
+│   │   └── prefs.py        # Legacy preferences
+│   │
+│   ├── mcp/                # MCP server management
+│   │   ├── config.py
+│   │   ├── registry.py
+│   │   └── manager.py
+│   │
+│   ├── constants/          # Paths, models, prompts
+│   └── utils/
+│
+├── scripts/                # Install scripts
+├── assets/                 # Screenshots
+└── tests/                  # pytest unit tests (`python -m pytest tests/ -q`)
+```
+
+---
+
+## 📝 Notes
+
+- **macOS permissions** — UI control tools need **Accessibility** and **Automation** permissions. Enable them in: System Settings → Privacy & Security → Accessibility / Automation.
+- **Credentials** — All config, keys, and history live under `~/.config/claude-agent/`.
+- **Tool selection is dynamic** — Parth only sends the schemas for tools it thinks you'll need, keeping context lean. Core file/code tools are always included; macOS, web, OCR tools are loaded on demand.
+- **Project context** — Drop a `PARTH.md` (or `CLAUDE.md`) in your project root, and the agent reads it automatically for project-specific instructions.
+
+---
+
+Built with ❤️ by [Prajwal Ramteke](https://github.com/PrajsRamteke)
+
+[GitHub](https://github.com/PrajsRamteke/parth-agent) · [Issues](https://github.com/PrajsRamteke/parth-agent/issues) · [Discussions](https://github.com/PrajsRamteke/parth-agent/discussions)

@@ -1,0 +1,24 @@
+# Parth — verified development setup (Python 3.10+)
+# Run from the repository root, one command at a time:
+#
+#   python3 -m venv .venv
+#   source .venv/bin/activate          # Windows: .venv\Scripts\activate
+#   pip install -e .                   # installs package + deps below; registers `parth`
+#   parth --help                      # verify CLI
+#   pip install pytest                 # test runner (not required to run the agent)
+#   python -m pytest tests/ -q         # full unit test suite
+#
+# `pip install -r requirements.txt` installs only the libraries listed below.
+# It does not register the `parth` command — use `pip install -e .` for local dev.
+
+anthropic>=0.40
+rich>=13
+textual>=0.80
+pypdf>=4.0
+openpyxl>=3.0
+openai>=1.0
+mcp>=1.0.0
+qrcode>=7.4
+pyperclip>=1.8
+Pillow>=10.0
+pytesseract>=0.3.10
